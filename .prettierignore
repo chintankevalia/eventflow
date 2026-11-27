@@ -1,0 +1,10 @@
+.next
+node_modules
+.data
+storage
+prisma/migrations
+package-lock.json
+src/components/brand/paths.ts
+brand
+public
+prisma/schema.prisma

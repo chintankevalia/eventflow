@@ -1,0 +1,60 @@
+# EventFlow full stack in Docker: PostgreSQL 16, Mailpit (dev mail catcher) and the app.
+#   docker compose up -d --build
+# App: http://localhost:3000   Mailpit inbox: http://localhost:8025
+#
+# Required env in a .env file next to this compose file (never commit it):
+#   POSTGRES_PASSWORD, HUBSPOT_ENCRYPT_KEY
+# Optional overrides: APP_URL, MAIL_FROM, SMTP_* (use "smtp" transport for production mail)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: eventflow
+      POSTGRES_USER: eventflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eventflow -d eventflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025" # SMTP
+      - "127.0.0.1:8025:8025" # web inbox
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://eventflow:${POSTGRES_PASSWORD}@postgres:5432/eventflow
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      # Mail: switch to "smtp" and set SMTP_* vars to send real email.
+      MAIL_TRANSPORT: ${MAIL_TRANSPORT:-outbox}
+      MAIL_FROM: ${MAIL_FROM:-EventFlow <eventflow@motadata.com>}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # HubSpot integration — required when using the HubSpot sync feature.
+      HUBSPOT_ENCRYPT_KEY: ${HUBSPOT_ENCRYPT_KEY:-}
+    ports:
+      - "3000:3000"
+    volumes:
+      - uploads:/app/storage
+
+volumes:
+  pgdata:
+  uploads:

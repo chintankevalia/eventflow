@@ -1,0 +1,132 @@
+/*
+ * Motadata design tokens: the single source of brand styling for EventFlow.
+ *
+ * Brand colours were verified from the official logo files (brand/source/*.png):
+ *   ink (light)  #000000   ink (dark)  #FFFFFF   accent  #F17463
+ * Neutrals, text and radius follow motadata.com.
+ *
+ * Decision (13-Oct-2026, product owner): primary buttons and links use the exact
+ * brand coral #F17463 with white text, matching motadata.com. This is below
+ * WCAG AA text contrast (2.8:1), so button labels are set semibold to help.
+ * To change it, edit --primary / --primary-foreground only.
+ */
+
+:root {
+  --brand-coral: #f17463;
+  --brand-ink: #000000;
+
+  --background: #f7f8fa; /* app canvas */
+  --foreground: #0f172a; /* hsl(222 47% 11%) */
+  --card: #ffffff;
+  --card-foreground: #0f172a;
+  --popover: #ffffff;
+  --popover-foreground: #0f172a;
+
+  --primary: #f17463;
+  --primary-hover: #e8604e;
+  --primary-foreground: #ffffff;
+  --primary-soft: #fdeceb; /* tinted backgrounds, active nav */
+
+  --secondary: #f3f4f6;
+  --secondary-foreground: #0f172a;
+  --muted: #f3f4f6; /* hsl(220 14% 96%) */
+  --muted-foreground: #6b7280; /* hsl(220 9% 46%) */
+  --accent: #f3f4f6;
+  --accent-foreground: #0f172a;
+
+  --border: #e5e7eb; /* hsl(220 13% 91%) */
+  --input: #d1d5db;
+  --ring: #f17463;
+
+  --success: #15803d;
+  --success-soft: #dcfce7;
+  --warning: #b45309;
+  --warning-soft: #fef3c7;
+  --destructive: #dc2626;
+  --destructive-soft: #fee2e2;
+  --destructive-foreground: #ffffff;
+  --info: #1d4ed8;
+  --info-soft: #dbeafe;
+
+  /* Categorical chart series.
+   *
+   * These exist because the semantic colours above cannot do this job: a donut of eight event
+   * types would have to colour one city `--success` green and another `--destructive` red, which
+   * actively misleads. Status colours stay reserved and are never reused as a series.
+   *
+   * Brand coral is always series 1, so a chart's primary figure matches the portal's accent.
+   * Slots 2-6 were chosen by running the palette through a colour-vision and contrast validator
+   * until every check passed: all six inside the lightness band, none reading as grey, and the
+   * closest adjacent pair separated by dE 13.5 under deuteranopia and 19.8 in normal vision.
+   * Hues are assigned in this fixed order and never cycled - a seventh category folds into
+   * "Other" rather than reusing a colour.
+   *
+   * Coral against white is 2.8:1, below the 3:1 the validator wants for a mark. The relief it
+   * requires is already in place: every chart in this app ships a real data table beside it.
+   *
+   * An official Motadata palette replaces slots 2-6 by editing this block and nothing else. */
+  --chart-1: #f17463;
+  --chart-2: #3b5bdb;
+  --chart-3: #0d9488;
+  --chart-4: #a16207;
+  --chart-5: #7c3aed;
+  --chart-6: #be185d;
+
+  --sidebar: #ffffff;
+  --sidebar-foreground: #0f172a;
+  --sidebar-border: #e5e7eb;
+
+  --radius: 0.625rem;
+}
+
+.dark {
+  --brand-ink: #ffffff;
+
+  --background: #0b1120;
+  --foreground: #f1f5f9;
+  --card: #111a2e;
+  --card-foreground: #f1f5f9;
+  --popover: #111a2e;
+  --popover-foreground: #f1f5f9;
+
+  --primary: #f17463;
+  --primary-hover: #f48a7c;
+  --primary-foreground: #ffffff;
+  --primary-soft: #3a1f22;
+
+  --secondary: #1b2539;
+  --secondary-foreground: #f1f5f9;
+  --muted: #1b2539;
+  --muted-foreground: #94a3b8;
+  --accent: #1b2539;
+  --accent-foreground: #f1f5f9;
+
+  --border: #233049;
+  --input: #2d3b57;
+  --ring: #f17463;
+
+  --success: #4ade80;
+  --success-soft: #12301f;
+  --warning: #fbbf24;
+  --warning-soft: #3a2a0c;
+  --destructive: #f87171;
+  --destructive-soft: #3b1515;
+  --destructive-foreground: #ffffff;
+  --info: #60a5fa;
+  --info-soft: #132a4a;
+
+  /* Dark mode is stepped for the dark surface, not flipped. The band here is tighter
+   * (L 0.48-0.67), so slots 2-6 are their own values rather than the light ones lightened, and
+   * all six clear 3:1 against the card. Coral stays exactly the brand coral: it sits marginally
+   * above the band, which is accepted so that the primary series always reads as Motadata. */
+  --chart-1: #f17463;
+  --chart-2: #6d8cf0;
+  --chart-3: #13a99a;
+  --chart-4: #c2850c;
+  --chart-5: #8f6fe8;
+  --chart-6: #db4a87;
+
+  --sidebar: #0f172a;
+  --sidebar-foreground: #f1f5f9;
+  --sidebar-border: #1e293b;
+}

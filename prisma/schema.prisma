@@ -1,0 +1,1169 @@
+// EventFlow database schema.
+// Domain models arrive phase by phase: users, sessions and audit (Phase 1); master data and
+// form config (Phase 2); events (Phase 3); approvals (Phase 4) …
+
+generator client {
+  provider = "prisma-client-js"
+  // "native" covers local dev (Windows). "debian-openssl-3.0.x" is added so a production bundle
+  // can be built on a non-Linux dev machine and still ship a working query engine for a
+  // Debian/Ubuntu (glibc, OpenSSL 3.x) server — `npm ci --os=linux --cpu=x64 --libc=glibc`
+  // fetches the matching native deps, and `prisma generate` then needs this listed to also
+  // produce that engine rather than only the host's own.
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Key/value application settings managed by administrators (SLA hours, CC rules, feature toggles).
+model AppSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@map("app_settings")
+}
+
+// ─── Users & access ────────────────────────────────────────────────────────────
+
+enum Role {
+  REQUESTER
+  EVENT_OWNER
+  EVENT_MANAGER
+  APPROVER /// Stage 1 approver (Akshay, Mitul)
+  EXECUTIVE_APPROVER /// Final approver (Amit sir)
+  FINANCE
+  ADMIN
+  REPORTING
+}
+
+enum Department {
+  SALES
+  MARKETING
+  CHANNEL
+  FINANCE
+  MANAGEMENT
+  OTHER
+}
+
+enum UserStatus {
+  INVITED /// Account created; password not set yet
+  ACTIVE
+  DEACTIVATED /// Kept for audit history; cannot sign in
+}
+
+model User {
+  id                String      @id @default(cuid())
+  /// Always stored lower-case.
+  email             String      @unique
+  name              String
+  jobTitle          String?
+  phone             String?
+  department        Department?
+  roles             Role[]
+  status            UserStatus  @default(INVITED)
+  passwordHash      String?
+  passwordChangedAt DateTime?
+  failedLoginCount  Int         @default(0)
+  lastLoginAt       DateTime?
+  /// "Never show the welcome tour again", set from its own checkbox — distinct from having
+  /// merely closed or finished it, which still prompts again next sign-in until every section
+  /// relevant to the viewer's roles is in `tourSeenSections`.
+  tourDismissed     Boolean     @default(false)
+  /// Keys from TOUR_SECTIONS (src/lib/tour-content.ts) the user has completed or skipped, so a
+  /// re-prompted tour resumes at the first one still pending rather than repeating from scratch.
+  tourSeenSections  String[]    @default([])
+  createdById       String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  createdBy     User?          @relation("UserCreatedBy", fields: [createdById], references: [id])
+  createdUsers  User[]         @relation("UserCreatedBy")
+  sessions      Session[]
+  authTokens    AuthToken[]
+  auditLogs     AuditLog[]     @relation("AuditActor")
+  organizations Organization[]
+
+  requestedEvents   Event[]                 @relation("EventRequester")
+  ownedEvents       Event[]                 @relation("EventOwner")
+  managedEvents     Event[]                 @relation("EventManager")
+  stakeholderIn     EventStakeholder[]
+  assignedTasks     Task[]
+  uploads           Attachment[]
+  eventVersions     EventVersion[]
+  createdTemplates  EventTemplate[]
+  approverStages    ApprovalStageApprover[]
+  submittedRounds   ApprovalRound[]
+  approvalDecisions ApprovalDecision[]
+  approvalTokens    ApprovalToken[]
+  importBatches     ImportBatch[]
+  dashboards        Dashboard[]             @relation("DashboardOwner")
+  salesReviews      SalesReview[]
+  dashboardShares   DashboardShare[]        @relation("DashboardSharedWith")
+
+  @@index([status])
+  @@map("users")
+}
+
+model Session {
+  /// SHA-256 of the session token; the raw token only ever lives in the user's cookie.
+  id         String   @id
+  userId     String
+  expiresAt  DateTime
+  lastSeenAt DateTime @default(now())
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+enum AuthTokenType {
+  INVITE
+  PASSWORD_RESET
+}
+
+/// Single-use links sent by email. Only the hash is stored.
+model AuthToken {
+  id        String        @id @default(cuid())
+  tokenHash String        @unique
+  type      AuthTokenType
+  userId    String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@map("auth_tokens")
+}
+
+/// Fixed-window counters for login / password-reset throttling (works across app instances).
+model RateLimit {
+  key         String   @id
+  count       Int
+  windowStart DateTime
+
+  @@map("rate_limits")
+}
+
+// ─── Audit ─────────────────────────────────────────────────────────────────────
+
+/// Append-only. A database trigger rejects UPDATE and DELETE (see migration).
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  summary    String
+  before     Json?
+  after      Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id])
+
+  @@index([entityType, entityId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ─── Master data & configuration (Phase 2) ──────────────────────────────────────
+
+/// Admin-managed lookup lists used across the event form, so values can change without code (FR-23).
+enum LookupKind {
+  PARTNER_TIER /// Gold, Silver … drives tier-based form rules
+  COLLABORATION_MODEL
+  REGION
+  INDUSTRY
+  PRODUCT_FOCUS /// ObserveOps, ServiceOps, Both
+  EVENT_FORMAT /// Physical, Virtual, Hybrid
+}
+
+model LookupItem {
+  id        String     @id @default(cuid())
+  kind      LookupKind
+  /// Stable machine value referenced by events; label is what users see.
+  value     String
+  label     String
+  sortOrder Int        @default(0)
+  active    Boolean    @default(true)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  partnerOrganizations Organization[] @relation("OrganizationTier")
+
+  @@unique([kind, value])
+  @@index([kind, active, sortOrder])
+  @@map("lookup_items")
+}
+
+enum OrganizationType {
+  CUSTOMER
+  PARTNER
+  DISTRIBUTOR
+}
+
+enum OrganizationStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+/// Customers, partners and distributors. HubSpot is the system of record later (Phase 8).
+model Organization {
+  id          String             @id @default(cuid())
+  type        OrganizationType
+  name        String
+  /// Partner / distributor ranking (LookupItem of kind PARTNER_TIER); null for customers.
+  tierId      String?
+  website     String?
+  city        String?
+  notes       String?
+  status      OrganizationStatus @default(ACTIVE)
+  hubspotId   String?            @unique
+  createdById String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  tier      LookupItem? @relation("OrganizationTier", fields: [tierId], references: [id])
+  createdBy User?       @relation(fields: [createdById], references: [id])
+  contacts  Contact[]
+  events    Event[]     @relation("EventPartner")
+
+  @@index([type, status])
+  @@index([name])
+  @@map("organizations")
+}
+
+model Contact {
+  id             String             @id @default(cuid())
+  organizationId String
+  name           String
+  email          String?
+  phone          String?
+  jobTitle       String?
+  isPrimary      Boolean            @default(false)
+  status         OrganizationStatus @default(ACTIVE)
+  hubspotId      String?            @unique
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@map("contacts")
+}
+
+/// Event types (Customer, End customer with partner, Partner meet, Distributor) and their subtypes.
+model EventType {
+  id           String   @id @default(cuid())
+  key          String   @unique
+  name         String
+  /// If true, an event of this type requires partner/distributor details.
+  needsPartner Boolean  @default(false)
+  sortOrder    Int      @default(0)
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  subtypes   EventSubtype[]
+  fieldRules FieldRule[]
+  events     Event[]
+  templates  EventTemplate[]
+
+  @@map("event_types")
+}
+
+model EventSubtype {
+  id          String   @id @default(cuid())
+  eventTypeId String
+  name        String
+  sortOrder   Int      @default(0)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  eventType EventType       @relation(fields: [eventTypeId], references: [id], onDelete: Cascade)
+  events    Event[]
+  templates EventTemplate[]
+
+  @@unique([eventTypeId, name])
+  @@map("event_subtypes")
+}
+
+/// Expense line-item categories (Venue, Food, Travel …), rolled up on events (FR-21).
+model ExpenseCategory {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  costLines CostLineItem[]
+
+  @@map("expense_categories")
+}
+
+// ─── Form-field configuration (FR-03, FR-23) ─────────────────────────────────────
+
+/// The five fixed sections of the event request form.
+enum FormSection {
+  BASIC_DETAILS
+  STAKEHOLDERS
+  BUDGET
+  PLANNING
+  POST_EVENT
+}
+
+enum FieldType {
+  TEXT
+  TEXTAREA
+  NUMBER
+  CURRENCY
+  DATE
+  SELECT
+  MULTISELECT
+  CHECKBOX
+  URL
+  EMAIL
+  PHONE
+}
+
+/// Admin-definable custom fields added on top of the built-in ones. Values live in the event's JSON.
+model FormField {
+  id        String      @id @default(cuid())
+  section   FormSection
+  /// Stable key used in the event's answers JSON (custom keys are prefixed "custom.").
+  key       String      @unique
+  label     String
+  type      FieldType
+  helpText  String?
+  /// Options for SELECT / MULTISELECT: [{ value, label }].
+  options   Json?
+  sortOrder Int         @default(0)
+  active    Boolean     @default(true)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@index([section, active, sortOrder])
+  @@map("form_fields")
+}
+
+/// Whether a field (built-in or custom, by its key) is required / visible for an event type and tier.
+/// `tierValue` is "" for "any tier" (a sentinel avoids NULL-uniqueness pitfalls) or a PARTNER_TIER value.
+model FieldRule {
+  id          String   @id @default(cuid())
+  eventTypeId String
+  fieldKey    String
+  tierValue   String   @default("")
+  required    Boolean  @default(false)
+  visible     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  eventType EventType @relation(fields: [eventTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([eventTypeId, fieldKey, tierValue])
+  @@index([eventTypeId])
+  @@map("field_rules")
+}
+
+// ─── Events (Phase 3) ────────────────────────────────────────────────────────
+
+/// Operational stage: Request → Scheduling → Approval → Execution → Closure (confirmed 13-Oct-2026).
+enum LifecycleStatus {
+  DRAFT
+  SCHEDULING
+  PENDING_APPROVAL
+  APPROVED
+  IN_EXECUTION
+  CLOSED
+  DROPPED
+}
+
+/// Kept separate from the lifecycle so an event's operational state is never confused with its
+/// approval state (PRD §6.1).
+enum ApprovalStatus {
+  NOT_SUBMITTED
+  PENDING
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+}
+
+/// Sales' go / no-go on whether an event is worth running, asked before any planning starts.
+/// NOT_REQUIRED covers every event that existed before the gate (imported history).
+enum SalesReviewStatus {
+  NOT_REQUIRED
+  PENDING
+  GO
+  NO_GO
+}
+
+model Event {
+  id    String @id @default(cuid())
+  /// Human-facing identifier, e.g. EF-2026-0001 (FR-19).
+  code  String @unique
+  title String
+
+  eventTypeId  String
+  subtypeId    String?
+  department   Department
+  requesterId  String
+  ownerId      String?
+  managerId    String?
+  /// Partner or distributor for partner-led event types.
+  partnerOrgId String?
+  /// Tier captured at selection time, so a later tier change cannot alter an approved event's rules.
+  partnerTier  String?
+  templateId   String?
+
+  lifecycleStatus LifecycleStatus @default(DRAFT)
+  approvalStatus  ApprovalStatus  @default(NOT_SUBMITTED)
+  droppedReason   String?
+  salesReviewStatus SalesReviewStatus @default(NOT_REQUIRED)
+
+  /// Promoted from `answers` on save, for filtering, sorting and reports.
+  proposedDate DateTime?
+  durationDays Int?
+  city         String?
+  region       String?
+  format       String?
+  productFocus String?
+  /// Promoted from `custom.venue` so dashboards can group spend by venue. A custom field is
+  /// promoted only when it needs to be reported on — grouping inside the `answers` blob would
+  /// be unindexed, untyped, and would break saved dashboards when an admin renames the field.
+  venue        String?
+
+  /// Money, all INR. Totals are recalculated from cost lines whenever those change.
+  estimatedCost        Decimal  @default(0) @db.Decimal(14, 2)
+  approvedCost         Decimal? @db.Decimal(14, 2)
+  actualCost           Decimal  @default(0) @db.Decimal(14, 2)
+  motadataContribution Decimal? @db.Decimal(14, 2)
+  partnerContribution  Decimal? @db.Decimal(14, 2)
+  mdfAllocation        Decimal? @db.Decimal(14, 2)
+
+  /// Answers to configurable fields, keyed by field key (see src/lib/form-schema.ts).
+  answers Json @default("{}")
+
+  submittedAt DateTime?
+  approvedAt  DateTime?
+  closedAt    DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  eventType       EventType          @relation(fields: [eventTypeId], references: [id])
+  subtype         EventSubtype?      @relation(fields: [subtypeId], references: [id])
+  requester       User               @relation("EventRequester", fields: [requesterId], references: [id])
+  owner           User?              @relation("EventOwner", fields: [ownerId], references: [id])
+  manager         User?              @relation("EventManager", fields: [managerId], references: [id])
+  partnerOrg      Organization?      @relation("EventPartner", fields: [partnerOrgId], references: [id])
+  template        EventTemplate?     @relation(fields: [templateId], references: [id])
+  stakeholders    EventStakeholder[]
+  costLines       CostLineItem[]
+  tasks           Task[]
+  attachments     Attachment[]
+  speakers        Speaker[]
+  versions        EventVersion[]
+  approvalRounds  ApprovalRound[]
+  notifications   NotificationLog[]
+  postEventResult PostEventResult?
+  salesReview     SalesReview?
+
+  @@index([lifecycleStatus, proposedDate])
+  @@index([department, lifecycleStatus])
+  @@index([ownerId])
+  @@index([salesReviewStatus])
+  @@index([requesterId])
+  @@index([eventTypeId])
+  // Dashboard group-bys and filters. `proposedDate` alone because the composite index above
+  // leads with `lifecycleStatus`, and Postgres 16 has no index skip scan — so a date-only
+  // filter, the most common one in the app, could not use it.
+  @@index([proposedDate])
+  @@index([partnerOrgId])
+  @@index([managerId])
+  @@index([subtypeId])
+  @@index([venue])
+  @@map("events")
+}
+
+/// People involved beyond the owner and manager, with their responsibility.
+model EventStakeholder {
+  id             String   @id @default(cuid())
+  eventId        String
+  userId         String?
+  /// Used when the person is not an EventFlow user (e.g. a partner contact).
+  externalName   String?
+  role           String
+  responsibility String?
+  sortOrder      Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User? @relation(fields: [userId], references: [id])
+
+  @@index([eventId])
+  @@map("event_stakeholders")
+}
+
+enum InvoiceStatus {
+  NOT_RAISED
+  RECEIVED
+  PAID
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+}
+
+/// Line-item costing rolled up to the event and department (FR-21).
+model CostLineItem {
+  id            String         @id @default(cuid())
+  eventId       String
+  categoryId    String?
+  description   String
+  estimated     Decimal        @default(0) @db.Decimal(14, 2)
+  approved      Decimal?       @db.Decimal(14, 2)
+  actual        Decimal?       @db.Decimal(14, 2)
+  vendor        String?
+  invoiceRef    String?
+  invoiceStatus InvoiceStatus  @default(NOT_RAISED)
+  paymentStatus PaymentStatus?
+  sortOrder     Int            @default(0)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  event    Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  category ExpenseCategory? @relation(fields: [categoryId], references: [id])
+  invoices Attachment[]
+
+  @@index([eventId])
+  /// Dashboards group spend by expense category.
+  @@index([categoryId])
+  @@map("cost_line_items")
+}
+
+/// Sales' business case for an event: the eleven qualifying questions and the five-factor decision
+/// matrix (src/lib/sales-review.ts), plus the go / no-go. One per event.
+model SalesReview {
+  id           String    @id @default(cuid())
+  eventId      String    @unique
+  /// Answers keyed by question key — see SALES_REVIEW_QUESTIONS in src/lib/sales-review.ts.
+  answers      Json      @default("{}")
+  /// Sum of the five 1–5 decision-matrix scores (5–25); null until all five are scored.
+  totalScore   Int?
+  decision     SalesReviewStatus @default(PENDING)
+  comment      String?
+  reviewedById String?
+  reviewedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  event      Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  reviewedBy User? @relation(fields: [reviewedById], references: [id])
+
+  @@map("sales_reviews")
+}
+
+/// Post-event performance results (FR-08). One record per event, created on/after event date.
+model PostEventResult {
+  id                     String   @id @default(cuid())
+  eventId                String   @unique
+  actualAttendance       Int?
+  companiesEngaged       Int?
+  newLeads               Int?
+  sqls                   Int?
+  opportunities          Int?
+  partnerParticipation   String?
+  meetingsConducted      Int?
+  satisfactionScore      String?
+  followUpOwner          String?
+  nextAction             String?
+  actualRoi              String?
+  actualRoiJustification String?
+  notes                  String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@map("post_event_results")
+}
+
+enum TaskStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  BLOCKED
+  DONE
+}
+
+model Task {
+  id        String     @id @default(cuid())
+  eventId   String
+  title     String
+  ownerId   String?
+  dueDate   DateTime?
+  status    TaskStatus @default(NOT_STARTED)
+  notes     String?
+  sortOrder Int        @default(0)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  event     Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  owner     User?            @relation(fields: [ownerId], references: [id])
+  dependsOn TaskDependency[] @relation("DependentTask")
+  blocking  TaskDependency[] @relation("BlockingTask")
+
+  @@index([eventId, status])
+  @@index([ownerId, dueDate])
+  @@map("tasks")
+}
+
+/// `taskId` cannot start until `dependsOnTaskId` is done.
+model TaskDependency {
+  id              String @id @default(cuid())
+  taskId          String
+  dependsOnTaskId String
+
+  task      Task @relation("DependentTask", fields: [taskId], references: [id], onDelete: Cascade)
+  dependsOn Task @relation("BlockingTask", fields: [dependsOnTaskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, dependsOnTaskId])
+  @@map("task_dependencies")
+}
+
+model Speaker {
+  id           String   @id @default(cuid())
+  eventId      String
+  name         String
+  organization String?
+  topic        String?
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@map("speakers")
+}
+
+enum AttachmentKind {
+  /// Budget details / cost breakup.
+  BUDGET_DETAILS
+  INTERNAL_COSTING
+  PRESENTATION
+  AGENDA
+  PROPOSAL
+  QUOTATION
+  INVOICE
+  RECEIPT
+  REPORT
+  PHOTO
+  OTHER
+}
+
+model Attachment {
+  id           String         @id @default(cuid())
+  eventId      String
+  /// Set only for an INVOICE attached from a specific budget line (Finance's per-line upload).
+  /// A general Files-tab upload leaves this null.
+  costLineId   String?
+  kind         AttachmentKind @default(OTHER)
+  fileName     String
+  /// Path inside the configured storage root; never a client-supplied path.
+  storageKey   String
+  contentType  String
+  sizeBytes    Int
+  uploadedById String
+  createdAt    DateTime       @default(now())
+
+  event      Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  // SetNull, not Cascade: a cost line can only be deleted while the plan is still editable
+  // (DRAFT/SCHEDULING), and an invoice can only be uploaded once the event is approved — the two
+  // never coincide in practice, but losing an uploaded invoice file if they ever did would be the
+  // wrong failure mode. The attachment survives as a plain event file instead.
+  costLine   CostLineItem? @relation(fields: [costLineId], references: [id], onDelete: SetNull)
+  uploadedBy User          @relation(fields: [uploadedById], references: [id])
+
+  @@index([eventId, kind])
+  @@index([costLineId])
+  @@map("attachments")
+}
+
+/// Snapshot of the plan and costing at each submission; the approved one is locked (FR-20).
+model EventVersion {
+  id          String   @id @default(cuid())
+  eventId     String
+  versionNo   Int
+  snapshot    Json
+  createdById String
+  createdAt   DateTime @default(now())
+
+  event     Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  createdBy User            @relation(fields: [createdById], references: [id])
+  rounds    ApprovalRound[]
+
+  @@unique([eventId, versionNo])
+  @@map("event_versions")
+}
+
+/// Reusable starting point for new requests: prefilled answers, cost lines and a task checklist.
+model EventTemplate {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  eventTypeId String
+  subtypeId   String?
+  /// Prefilled answers by field key.
+  answers     Json     @default("{}")
+  /// [{ description, categoryId, estimated }]
+  costLines   Json     @default("[]")
+  /// [{ title, offsetDays, notes }] — offsetDays is relative to the event date (negative = before).
+  tasks       Json     @default("[]")
+  active      Boolean  @default(true)
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  eventType EventType     @relation(fields: [eventTypeId], references: [id], onDelete: Cascade)
+  subtype   EventSubtype? @relation(fields: [subtypeId], references: [id])
+  createdBy User?         @relation(fields: [createdById], references: [id])
+  events    Event[]
+
+  @@index([eventTypeId, active])
+  @@map("event_templates")
+}
+
+/// Per-year running number behind the EF-YYYY-NNNN event code.
+model EventCodeCounter {
+  year Int @id
+  last Int @default(0)
+
+  @@map("event_code_counters")
+}
+
+// ─── Approvals (Phase 4) ─────────────────────────────────────────────────────
+
+/// How a stage reaches its verdict.
+enum StageMode {
+  ALL /// every approver must approve (Stage 1: Akshay and Mitul, in parallel)
+  ANY /// the first approval carries the stage
+  SEQUENTIAL /// approvers decide in order
+}
+
+/// A configurable chain of approval stages. Exactly one workflow is active at a time.
+model ApprovalWorkflow {
+  id        String   @id @default(cuid())
+  name      String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stages ApprovalStage[]
+  rounds ApprovalRound[]
+
+  @@map("approval_workflows")
+}
+
+model ApprovalStage {
+  id              String    @id @default(cuid())
+  workflowId      String
+  name            String
+  /// 1, 2, … — stages run in this order.
+  sequence        Int
+  mode            StageMode @default(ALL)
+  /// Hours of no decision before a reminder, and before escalation. Admin-configurable.
+  reminderHours   Int       @default(24)
+  escalationHours Int       @default(48)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  workflow  ApprovalWorkflow        @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  approvers ApprovalStageApprover[]
+  rounds    ApprovalRound[]
+  decisions ApprovalDecision[]
+  tokens    ApprovalToken[]
+
+  @@unique([workflowId, sequence])
+  @@map("approval_stages")
+}
+
+model ApprovalStageApprover {
+  id        String   @id @default(cuid())
+  stageId   String
+  userId    String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  stage ApprovalStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  user  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([stageId, userId])
+  @@map("approval_stage_approvers")
+}
+
+enum RoundStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+  SUPERSEDED /// a newer submission replaced this one
+}
+
+enum DecisionType {
+  APPROVE
+  REJECT
+  REQUEST_CHANGES
+}
+
+enum DecisionChannel {
+  PORTAL
+  EMAIL
+}
+
+/// One trip through the approval chain, tied to the exact event version that was submitted.
+/// (The PRD calls this the "approval request"; renamed here so it is never confused with the
+/// event request itself.)
+model ApprovalRound {
+  id             String      @id @default(cuid())
+  eventId        String
+  versionId      String
+  workflowId     String
+  currentStageId String?
+  status         RoundStatus @default(PENDING)
+  submittedById  String
+  submittedAt    DateTime    @default(now())
+  completedAt    DateTime?
+  /// Reminder/escalation bookkeeping for the current stage.
+  stageEnteredAt DateTime    @default(now())
+  lastReminderAt DateTime?
+  escalatedAt    DateTime?
+
+  event        Event              @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  version      EventVersion       @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  workflow     ApprovalWorkflow   @relation(fields: [workflowId], references: [id])
+  currentStage ApprovalStage?     @relation(fields: [currentStageId], references: [id])
+  submittedBy  User               @relation(fields: [submittedById], references: [id])
+  decisions    ApprovalDecision[]
+  tokens       ApprovalToken[]
+
+  @@index([status, stageEnteredAt])
+  @@index([eventId])
+  @@map("approval_rounds")
+}
+
+/// Immutable record of one approver's verdict (FR-12, FR-22).
+model ApprovalDecision {
+  id         String          @id @default(cuid())
+  roundId    String
+  stageId    String
+  approverId String
+  decision   DecisionType
+  comment    String?
+  channel    DecisionChannel @default(PORTAL)
+  ipAddress  String?
+  decidedAt  DateTime        @default(now())
+
+  round    ApprovalRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  stage    ApprovalStage @relation(fields: [stageId], references: [id])
+  approver User          @relation(fields: [approverId], references: [id])
+
+  @@unique([roundId, stageId, approverId])
+  @@index([approverId, decidedAt])
+  /// Dashboards group decisions by approval stage; the unique index above leads with `roundId`.
+  @@index([stageId])
+  @@map("approval_decisions")
+}
+
+/// Single-use, time-limited link letting one approver decide from their email (PRD §7.1).
+/// Only the hash is stored, and it is bound to the round, stage, approver and version.
+model ApprovalToken {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique
+  roundId    String
+  stageId    String
+  approverId String
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  round    ApprovalRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  stage    ApprovalStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  approver User          @relation(fields: [approverId], references: [id], onDelete: Cascade)
+
+  @@index([roundId, approverId])
+  @@map("approval_tokens")
+}
+
+enum NotificationStatus {
+  SENT
+  FAILED
+}
+
+/// What EventFlow has emailed, so failures are visible and can be retried (PRD §11 Reliability).
+model NotificationLog {
+  id         String             @id @default(cuid())
+  eventId    String?
+  roundId    String?
+  kind       String
+  recipients String[]
+  ccList     String[]
+  subject    String
+  status     NotificationStatus @default(SENT)
+  error      String?
+  attempts   Int                @default(1)
+  createdAt  DateTime           @default(now())
+
+  event Event? @relation(fields: [eventId], references: [id], onDelete: SetNull)
+
+  @@index([eventId, createdAt])
+  @@index([status, createdAt])
+  @@map("notification_logs")
+}
+
+// ─── Excel Import ─────────────────────────────────────────────────────────────
+
+enum ImportBatchStatus {
+  PENDING /// File uploaded; mapping not yet confirmed
+  VALIDATED /// Mapping confirmed; preview computed with errors/warnings
+  PROCESSING /// Importing rows
+  DONE /// All rows processed
+  FAILED /// Fatal error (e.g. unparseable file)
+}
+
+enum ImportRowStatus {
+  OK
+  WARNING /// Row imported with non-fatal issues
+  ERROR /// Row skipped; see errors JSON
+  SKIPPED /// Duplicate or intentionally skipped
+}
+
+/// One upload session: tracks the file, column mapping, and overall progress.
+model ImportBatch {
+  id           String            @id @default(cuid())
+  uploadedById String
+  fileName     String
+  /// JSON mapping: { sourceColumn: string, targetField: string | null }[]
+  columnMap    Json              @default("[]")
+  status       ImportBatchStatus @default(PENDING)
+  totalRows    Int               @default(0)
+  okRows       Int               @default(0)
+  warnRows     Int               @default(0)
+  errorRows    Int               @default(0)
+  skippedRows  Int               @default(0)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  uploadedBy User        @relation(fields: [uploadedById], references: [id])
+  rows       ImportRow[]
+
+  @@index([uploadedById, createdAt])
+  @@map("import_batches")
+}
+
+/// One row from the Excel file.
+model ImportRow {
+  id       String          @id @default(cuid())
+  batchId  String
+  rowIndex Int
+  /// Raw cells as parsed from Excel, keyed by source column header.
+  rawData  Json
+  /// Mapped field values after column mapping is applied.
+  mapped   Json            @default("{}")
+  status   ImportRowStatus @default(OK)
+  /// Array of { field, message, severity } objects.
+  issues   Json            @default("[]")
+  /// Set once the event is created.
+  eventId  String?
+
+  batch ImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@index([batchId, rowIndex])
+  @@map("import_rows")
+}
+
+// ─── HubSpot Integration ──────────────────────────────────────────────────────
+
+enum SyncDirection {
+  HUBSPOT_TO_EF /// HubSpot is the system of record (companies/contacts inbound)
+  EF_TO_HUBSPOT /// EventFlow pushes event engagements to HubSpot outbound
+  BOTH
+}
+
+enum SyncJobStatus {
+  QUEUED
+  RUNNING
+  DONE
+  FAILED
+}
+
+enum SyncObjectType {
+  COMPANY
+  CONTACT
+  EVENT_ENGAGEMENT
+}
+
+/// Singleton config row for the HubSpot integration; there is at most one.
+/// The access token is AES-256-GCM encrypted at rest (key from HUBSPOT_ENCRYPT_KEY env var).
+model HubSpotConfig {
+  id              String    @id @default(cuid())
+  /// Whether the integration is active and should run sync jobs.
+  enabled         Boolean   @default(false)
+  /// HubSpot portal / account ID (numeric string).
+  portalId        String?
+  /// AES-GCM ciphertext | iv | authTag (base64, colon-separated). Never the plaintext.
+  encryptedToken  String?
+  /// Set after the first successful sync.
+  lastSyncAt      DateTime?
+  /// Admin-configurable field mapping: { efField: string, hubspotProperty: string }[].
+  companyFieldMap Json      @default("[]")
+  contactFieldMap Json      @default("[]")
+  /// Whether to create missing companies/contacts in EventFlow from HubSpot.
+  createOnInbound Boolean   @default(true)
+  /// Whether to push EventFlow events as HubSpot engagements.
+  pushEngagements Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("hubspot_config")
+}
+
+/// Queue of sync operations — one row per object being synced.
+model SyncJob {
+  id          String         @id @default(cuid())
+  objectType  SyncObjectType
+  direction   SyncDirection
+  /// The EventFlow record id (orgId, contactId, or eventId).
+  efId        String?
+  /// The HubSpot object id.
+  hubspotId   String?
+  status      SyncJobStatus  @default(QUEUED)
+  attempts    Int            @default(0)
+  /// Set on final failure; human-readable.
+  error       String?
+  scheduledAt DateTime       @default(now())
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime       @default(now())
+
+  @@index([status, scheduledAt])
+  @@index([objectType, efId])
+  @@map("sync_jobs")
+}
+
+/// Append-only log of individual sync errors for audit and retry tracking.
+model SyncError {
+  id         String         @id @default(cuid())
+  jobId      String?
+  objectType SyncObjectType
+  efId       String?
+  hubspotId  String?
+  message    String
+  payload    Json?
+  createdAt  DateTime       @default(now())
+
+  @@index([objectType, efId])
+  @@index([createdAt])
+  @@map("sync_errors")
+}
+
+// ─── Custom dashboards ───────────────────────────────────────────────────────
+
+/// Who, besides the owner and anyone named in `DashboardShare`, can open a dashboard.
+enum DashboardVisibility {
+  /// The owner only.
+  PRIVATE
+  /// Anyone holding one of `visibleRoles`.
+  ROLES
+  /// Everyone who can see dashboards at all.
+  EVERYONE
+}
+
+/// A user-built dashboard: a free-form canvas of widgets, each asking its own question.
+model Dashboard {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  ownerId     String
+
+  visibility   DashboardVisibility @default(PRIVATE)
+  /// Only meaningful when `visibility` is ROLES.
+  visibleRoles Role[]
+  /// The seeded Overview. Anyone may clone it; nobody may delete or edit it, so the portal
+  /// always has one dashboard that cannot be misconfigured.
+  isBuiltIn    Boolean             @default(false)
+
+  /// Dashboard-level filter defaults, inherited by every widget that does not override them.
+  /// Shape: a partial WidgetSpec — see src/server/dashboards/spec.ts.
+  filters   Json @default("{}")
+  sortOrder Int  @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner   User              @relation("DashboardOwner", fields: [ownerId], references: [id])
+  widgets DashboardWidget[]
+  shares  DashboardShare[]
+
+  @@index([ownerId])
+  @@index([visibility])
+  @@map("dashboards")
+}
+
+/// One widget on a dashboard: its geometry on the canvas, and the question it asks.
+model DashboardWidget {
+  id          String @id @default(cuid())
+  dashboardId String
+  title       String
+
+  /// Free-form canvas geometry. `x` and `w` are in a 0–1000 space that scales with the canvas
+  /// width, so a layout holds its proportions at any window size; `y` and `h` are pixels,
+  /// because vertical space is unbounded. `z` orders overlapping widgets.
+  x Int
+  y Int
+  w Int
+  h Int
+  z Int @default(0)
+
+  /// A WidgetSpec — metric, dimension, filters, grain. See src/server/dashboards/spec.ts.
+  /// Validated there, never by Prisma, and parsed so that it can never throw on read.
+  spec Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  dashboard Dashboard @relation(fields: [dashboardId], references: [id], onDelete: Cascade)
+
+  @@index([dashboardId])
+  @@map("dashboard_widgets")
+}
+
+/// Shares a dashboard with one person, whatever its `visibility`.
+model DashboardShare {
+  id          String  @id @default(cuid())
+  dashboardId String
+  userId      String
+  /// Whether the recipient may change widgets, or only look.
+  canEdit     Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  dashboard Dashboard @relation(fields: [dashboardId], references: [id], onDelete: Cascade)
+  user      User      @relation("DashboardSharedWith", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([dashboardId, userId])
+  @@index([userId])
+  @@map("dashboard_shares")
+}
